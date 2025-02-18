@@ -1,68 +1,89 @@
 ---@diagnostic disable: undefined-global, undefined-field, lowercase-global
 local MOS6502 = require("MOS6502")
+-- local PPU = require("PPU")
 
 local cpu = MOS6502.new()
+-- local picturecpu = PPU.new(characterdata)
 
-local buffer = ""
+local output = ""
 
 local ports = {
-  [0xD010] = function(value)
-    buffer = buffer .. string.char(value)
+  [0xD010] = function(letter)
+    output = output .. string.char(letter)
   end
 }
 
-cpu.write = function(self, address, value)
-  self.memory[address] = value & 0xFF
-  if ports[address] then ports[address](value) end
+cpu.write = function(self, location, letter)
+  self.memory[location] = letter & 0xFF
+  if ports[location] then
+    ports[location](letter)
+  end
 end
 
-local rom = read("blobs/rom.nes")
-if string.char(rom[1], rom[2], rom[3], rom[4]) ~= "NES\26" then error("Invalid NES ROM header.") end
+local romimage = read("blobs/rom.nes")
+if string.char(romimage[1], romimage[2], romimage[3], romimage[4]) ~= "NES\26" then
+  error("Invalid NES ROM header.")
+end
 
-local banks = rom[5]
-local size = banks * 16384
-local flag = rom[7]
+local programbanks = romimage[5]
+local characterbanks = romimage[6]
+local programsize = programbanks * 16384
+local charactersize = characterbanks * 8192
+local flag = romimage[7]
 local trainer = 0
-if (flag & 0x04) ~= 0 then trainer = 512 end
+if (flag & 0x04) ~= 0 then
+  trainer = 512
+end
 
 local offset = 16 + trainer
-local program = {}
-for i = 0, size - 1 do
-  program[i + 1] = rom[offset + i]
+local programdata = {}
+for index = 0, programsize - 1 do
+  programdata[index + 1] = romimage[offset + index]
 end
 
-local address = 0x8000
-if banks == 1 then
-  for i = 1, #program do
-    local byte = program[i]
-    cpu.memory[address + i - 1] = byte
-    cpu.memory[0xC000 + i - 1] = byte
+local characterdata = nil
+if characterbanks > 0 then
+  local chroffset = offset + programsize
+  characterdata = {}
+  for index = 0, charactersize - 1 do
+    characterdata[index + 1] = romimage[chroffset + index]
   end
-elseif banks >= 2 then
-  for i = 1, 16384 do
-    cpu.memory[address + i - 1] = program[i]
+end
+
+local startaddress = 0x8000
+if programbanks == 1 then
+  for index = 1, #programdata do
+    local byte = programdata[index]
+    cpu.memory[startaddress + index - 1] = byte
+    cpu.memory[0xC000 + index - 1] = byte
   end
-  for i = 16385, 32768 do
-    cpu.memory[0xC000 + i - 16385] = program[i]
+elseif programbanks >= 2 then
+  for index = 1, 16384 do
+    cpu.memory[startaddress + index - 1] = programdata[index]
+  end
+  for index = 16385, 32768 do
+    cpu.memory[0xC000 + index - 16385] = programdata[index]
   end
 else
   error("No PRG ROM banks found.")
 end
 
-cpu.memory[0xFFFC] = address & 0xFF
-cpu.memory[0xFFFD] = (address >> 8) & 0xFF
+cpu.memory[0xFFFC] = startaddress & 0xFF
+cpu.memory[0xFFFD] = (startaddress >> 8) & 0xFF
 
 function setup()
   engine = EngineFactory.new()
       :with_title("MOS6502")
-      :with_width(1920)
-      :with_height(1080)
-      :with_scale(3.0)
-      :with_gravity(9.8)
+      :with_width(256)
+      :with_height(240)
+      :with_scale(4.0)
       :with_fullscreen(false)
       :create()
 
+  -- local renderer = engine:renderer()
+
   cpu:reset()
+  -- picturecpu:reset(renderer)
 end
 
 function loop()
@@ -71,6 +92,44 @@ function loop()
   end
 
   cpu:step()
+  -- for count = 1, 3 do
+  --   picturecpu:step()
+  -- end
+
+  -- Screen dimensions
+  local width = 256
+  local height = 240
+  local squaresize = 50
+
+  -- Calculate the start and end of the red square
+  local centerx = math.floor(width / 2)
+  local centery = math.floor(height / 2)
+  local redstartx = centerx - math.floor(squaresize / 2) + 1
+  local redendx = redstartx + squaresize - 1
+  local redstarty = centery - math.floor(squaresize / 2) + 1
+  local redendy = redstarty + squaresize - 1
+
+  -- Prepare pixels as binary strings in ARGB8888 format
+  local blackpixel = string.pack("I4", 0xFF000000)
+  local redpixel = string.pack("I4", 0xFFFF0000)
+
+  -- Build the rows of the buffer optimally
+  local rows = {}
+  for line = 1, height do
+    if line >= redstarty and line <= redendy then
+      local leftcount = redstartx - 1
+      local redcount = squaresize
+      local rightcount = width - redendx
+      rows[line] = string.rep(blackpixel, leftcount)
+          .. string.rep(redpixel, redcount)
+          .. string.rep(blackpixel, rightcount)
+    else
+      rows[line] = string.rep(blackpixel, width)
+    end
+  end
+
+  local pixeldata = table.concat(rows)
+  engine:canvas().pixels = pixeldata
 end
 
 function run()
