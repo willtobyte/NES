@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install 7zip
+        run: sudo apt-get install p7zip-full
+
+      - name: Create bundle
+        run: 7z a -xr'!.git/*' -xr'!.git' -xr'!.*' -t7z -m0=lzma -mx=6 -mfb=64 -md=32m -ms=on bundle.7z .
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tagName }}
+          prerelease: ${{ github.events.inputs.prerelease }}
+          files: bundle.7z
