@@ -1,4 +1,4 @@
-local bit = bit or bit32
+local bit = require("bit")
 local band, bor, rshift = bit.band, bit.bor, bit.rshift
 
 local input = {}

@@ -1,4 +1,4 @@
-local bit = bit or bit32
+local bit = require("bit")
 local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
 local byte = string.byte
 
