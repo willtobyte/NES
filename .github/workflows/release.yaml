@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce non-fullscreen
+        run: |
+          sed -i -E 's/^(\s*:with_fullscreen\s*)\(true\)/\1(false)/' scripts/main.lua
+
+      - name: Create cartridge
+        run: |
+          find . -name '.*' ! -name '.' ! -name '..' -print
+          find . -name '.*' ! -name '.' ! -name '..' -exec rm -rf {} +
+
+          zip -r cartridge.rom .
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tagName }}
+          prerelease: ${{ github.events.inputs.prerelease }}
+          files: cartridge.rom
