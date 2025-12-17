@@ -4,7 +4,8 @@ local cpu = require("cpu")
 local ppu = require("ppu")
 local input = require("input")
 
-local CYCLES_PER_FRAME = 29781
+local CYCLES_PER_SCANLINE = 114
+local SCANLINES_PER_FRAME = 262
 
 local scene = {}
 
@@ -27,20 +28,15 @@ end
 function scene.on_loop()
     input.poll(keyboard)
 
-    local cycles = 0
-    while cycles < CYCLES_PER_FRAME do
-        local cpu_cycles = cpu.step()
-
-        for _ = 1, cpu_cycles * 3 do
-            ppu.step()
+    for _ = 1, SCANLINES_PER_FRAME do
+        local cycles = 0
+        while cycles < CYCLES_PER_SCANLINE do
+            cycles = cycles + cpu.step()
         end
 
-        if ppu.nmi_pending() then
-            ppu.clear_nmi()
+        if ppu.run_scanline() then
             cpu.nmi()
         end
-
-        cycles = cycles + cpu_cycles
     end
 
     canvas.pixels = ppu.get_framebuffer()
