@@ -20,8 +20,8 @@ function input.poll(keyboard)
     buttons = 0
     if keyboard.z then buttons = bor(buttons, BTN_A) end
     if keyboard.x then buttons = bor(buttons, BTN_B) end
-    if keyboard.a then buttons = bor(buttons, BTN_SELECT) end
-    if keyboard.s then buttons = bor(buttons, BTN_START) end
+    if keyboard.space then buttons = bor(buttons, BTN_SELECT) end
+    if keyboard.enter then buttons = bor(buttons, BTN_START) end
     if keyboard.up then buttons = bor(buttons, BTN_UP) end
     if keyboard.down then buttons = bor(buttons, BTN_DOWN) end
     if keyboard.left then buttons = bor(buttons, BTN_LEFT) end
