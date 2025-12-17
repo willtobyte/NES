@@ -10,15 +10,12 @@ local SCANLINES_PER_FRAME = 262
 local scene = {}
 
 function scene.on_enter()
-    local rom_file = io.open("donkeykong.nes", "rb")
-    if not rom_file then
-        error("Could not find donkeykong.nes")
-    end
+    local f  = io.open("donkeykong.nes", "rb")
 
-    local rom_data = rom_file:read("*a")
-    rom_file:close()
+    local data = f:read("*a")
+    f:close()
 
-    mapper.load(rom_data)
+    mapper.load(data)
     ppu.init(mapper)
     bus.connect(mapper, ppu, input)
     cpu.init(bus)
