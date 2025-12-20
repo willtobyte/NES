@@ -1,13 +1,20 @@
 local bit = require("bit")
-local band, bor, bxor, bnot = bit.band, bit.bor, bit.bxor, bit.bnot
+local band, bor, bxor = bit.band, bit.bor, bit.bxor
 local lshift, rshift = bit.lshift, bit.rshift
+local structs = require("ffi_structs")
 
 local cpu = {}
 
 local a, x, y, sp, pc
 local status
-local cycles
 local bus
+local bus_read, bus_write, bus_get_dma_cycles
+
+local ram = structs.ram
+local prg_rom
+local prg_mask
+local nz_flags = structs.nz_flags
+local signed_offset = structs.signed_offset
 
 local FLAG_C = 0x01
 local FLAG_Z = 0x02
@@ -18,508 +25,1589 @@ local FLAG_U = 0x20
 local FLAG_V = 0x40
 local FLAG_N = 0x80
 
-local function set_flag(flag, cond)
-    if cond then
-        status = bor(status, flag)
-    else
-        status = band(status, bxor(0xFF, flag))
-    end
-end
-
-local function get_flag(flag)
-    return band(status, flag) ~= 0
-end
-
-local function set_zn(value)
-    set_flag(FLAG_Z, value == 0)
-    set_flag(FLAG_N, band(value, 0x80) ~= 0)
-    return value
-end
+local FLAG_NZ_CLEAR = 0x7D
+local FLAG_CNZ_CLEAR = 0x7C
+local FLAG_CVNZ_CLEAR = 0x3C
 
 local function push(value)
-    bus.write(0x0100 + sp, value)
+    bus_write(0x0100 + sp, value)
     sp = band(sp - 1, 0xFF)
 end
 
 local function pull()
     sp = band(sp + 1, 0xFF)
-    return bus.read(0x0100 + sp)
+    return bus_read(0x0100 + sp)
 end
 
-local function push16(value)
-    push(rshift(value, 8))
-    push(band(value, 0xFF))
+local function read_code(addr)
+    return prg_rom[band(addr, prg_mask)]
 end
 
-local function pull16()
-    local lo = pull()
-    local hi = pull()
-    return bor(lo, lshift(hi, 8))
-end
-
-local addr_mode
-local addr_value
-local page_crossed
-
-local function imp() end
-local function acc() end
-
-local function imm()
-    addr_value = pc
-    pc = band(pc + 1, 0xFFFF)
-end
-
-local function zp()
-    addr_value = bus.read(pc)
-    pc = band(pc + 1, 0xFFFF)
-end
-
-local function zpx()
-    addr_value = band(bus.read(pc) + x, 0xFF)
-    pc = band(pc + 1, 0xFFFF)
-end
-
-local function zpy()
-    addr_value = band(bus.read(pc) + y, 0xFF)
-    pc = band(pc + 1, 0xFFFF)
-end
-
-local function abs()
-    addr_value = bus.read16(pc)
-    pc = band(pc + 2, 0xFFFF)
-end
-
-local function abx()
-    local base = bus.read16(pc)
-    addr_value = band(base + x, 0xFFFF)
-    page_crossed = band(base, 0xFF00) ~= band(addr_value, 0xFF00)
-    pc = band(pc + 2, 0xFFFF)
-end
-
-local function aby()
-    local base = bus.read16(pc)
-    addr_value = band(base + y, 0xFFFF)
-    page_crossed = band(base, 0xFF00) ~= band(addr_value, 0xFF00)
-    pc = band(pc + 2, 0xFFFF)
-end
-
-local function ind()
-    local ptr = bus.read16(pc)
-    addr_value = bus.read16_wrap(ptr)
-    pc = band(pc + 2, 0xFFFF)
-end
-
-local function izx()
-    local base = band(bus.read(pc) + x, 0xFF)
-    local lo = bus.read(base)
-    local hi = bus.read(band(base + 1, 0xFF))
-    addr_value = bor(lo, lshift(hi, 8))
-    pc = band(pc + 1, 0xFFFF)
-end
-
-local function izy()
-    local base = bus.read(pc)
-    local lo = bus.read(base)
-    local hi = bus.read(band(base + 1, 0xFF))
-    local addr = bor(lo, lshift(hi, 8))
-    addr_value = band(addr + y, 0xFFFF)
-    page_crossed = band(addr, 0xFF00) ~= band(addr_value, 0xFF00)
-    pc = band(pc + 1, 0xFFFF)
-end
-
-local function rel()
-    local offset = bus.read(pc)
-    pc = band(pc + 1, 0xFFFF)
-    if offset >= 128 then
-        offset = offset - 256
-    end
-    addr_value = band(pc + offset, 0xFFFF)
-end
-
-local function read_op()
-    return bus.read(addr_value)
-end
-
-local function write_op(v)
-    bus.write(addr_value, v)
-end
-
-local function adc()
-    local m = read_op()
-    local c = get_flag(FLAG_C) and 1 or 0
-    local sum = a + m + c
-    set_flag(FLAG_C, sum > 255)
-    set_flag(FLAG_V, band(bxor(a, sum), bxor(m, sum), 0x80) ~= 0)
-    a = set_zn(band(sum, 0xFF))
-end
-
-local function op_and()
-    a = set_zn(band(a, read_op()))
-end
-
-local function asl_a()
-    set_flag(FLAG_C, band(a, 0x80) ~= 0)
-    a = set_zn(band(lshift(a, 1), 0xFF))
-end
-
-local function asl()
-    local m = read_op()
-    set_flag(FLAG_C, band(m, 0x80) ~= 0)
-    write_op(set_zn(band(lshift(m, 1), 0xFF)))
-end
-
-local function branch(cond)
-    if cond then
-        cycles = cycles + 1
-        if band(pc, 0xFF00) ~= band(addr_value, 0xFF00) then
-            cycles = cycles + 1
-        end
-        pc = addr_value
-    end
-end
-
-local function bcc() branch(not get_flag(FLAG_C)) end
-local function bcs() branch(get_flag(FLAG_C)) end
-local function beq() branch(get_flag(FLAG_Z)) end
-local function bmi() branch(get_flag(FLAG_N)) end
-local function bne() branch(not get_flag(FLAG_Z)) end
-local function bpl() branch(not get_flag(FLAG_N)) end
-local function bvc() branch(not get_flag(FLAG_V)) end
-local function bvs() branch(get_flag(FLAG_V)) end
-
-local function op_bit()
-    local m = read_op()
-    set_flag(FLAG_Z, band(a, m) == 0)
-    set_flag(FLAG_V, band(m, 0x40) ~= 0)
-    set_flag(FLAG_N, band(m, 0x80) ~= 0)
-end
-
-local function brk()
-    pc = band(pc + 1, 0xFFFF)
-    push16(pc)
-    push(bor(status, FLAG_B, FLAG_U))
-    set_flag(FLAG_I, true)
-    pc = bus.read16(0xFFFE)
-end
-
-local function clc() set_flag(FLAG_C, false) end
-local function cld() set_flag(FLAG_D, false) end
-local function cli() set_flag(FLAG_I, false) end
-local function clv() set_flag(FLAG_V, false) end
-
-local function cmp()
-    local m = read_op()
-    set_flag(FLAG_C, a >= m)
-    set_zn(band(a - m, 0xFF))
-end
-
-local function cpx()
-    local m = read_op()
-    set_flag(FLAG_C, x >= m)
-    set_zn(band(x - m, 0xFF))
-end
-
-local function cpy()
-    local m = read_op()
-    set_flag(FLAG_C, y >= m)
-    set_zn(band(y - m, 0xFF))
-end
-
-local function dec()
-    write_op(set_zn(band(read_op() - 1, 0xFF)))
-end
-
-local function dex()
-    x = set_zn(band(x - 1, 0xFF))
-end
-
-local function dey()
-    y = set_zn(band(y - 1, 0xFF))
-end
-
-local function eor()
-    a = set_zn(bxor(a, read_op()))
-end
-
-local function inc()
-    write_op(set_zn(band(read_op() + 1, 0xFF)))
-end
-
-local function inx()
-    x = set_zn(band(x + 1, 0xFF))
-end
-
-local function iny()
-    y = set_zn(band(y + 1, 0xFF))
-end
-
-local function jmp()
-    pc = addr_value
-end
-
-local function jsr()
-    push16(band(pc - 1, 0xFFFF))
-    pc = addr_value
-end
-
-local function lda()
-    a = set_zn(read_op())
-end
-
-local function ldx()
-    x = set_zn(read_op())
-end
-
-local function ldy()
-    y = set_zn(read_op())
-end
-
-local function lsr_a()
-    set_flag(FLAG_C, band(a, 0x01) ~= 0)
-    a = set_zn(rshift(a, 1))
-end
-
-local function lsr()
-    local m = read_op()
-    set_flag(FLAG_C, band(m, 0x01) ~= 0)
-    write_op(set_zn(rshift(m, 1)))
-end
-
-local function nop() end
-
-local function ora()
-    a = set_zn(bor(a, read_op()))
-end
-
-local function pha()
-    push(a)
-end
-
-local function php()
-    push(bor(status, FLAG_B, FLAG_U))
-end
-
-local function pla()
-    a = set_zn(pull())
-end
-
-local function plp()
-    status = bor(band(pull(), 0xEF), FLAG_U)
-end
-
-local function rol_a()
-    local c = get_flag(FLAG_C) and 1 or 0
-    set_flag(FLAG_C, band(a, 0x80) ~= 0)
-    a = set_zn(band(bor(lshift(a, 1), c), 0xFF))
-end
-
-local function rol()
-    local m = read_op()
-    local c = get_flag(FLAG_C) and 1 or 0
-    set_flag(FLAG_C, band(m, 0x80) ~= 0)
-    write_op(set_zn(band(bor(lshift(m, 1), c), 0xFF)))
-end
-
-local function ror_a()
-    local c = get_flag(FLAG_C) and 0x80 or 0
-    set_flag(FLAG_C, band(a, 0x01) ~= 0)
-    a = set_zn(bor(rshift(a, 1), c))
-end
-
-local function ror()
-    local m = read_op()
-    local c = get_flag(FLAG_C) and 0x80 or 0
-    set_flag(FLAG_C, band(m, 0x01) ~= 0)
-    write_op(set_zn(bor(rshift(m, 1), c)))
-end
-
-local function rti()
-    status = bor(band(pull(), 0xEF), FLAG_U)
-    pc = pull16()
-end
-
-local function rts()
-    pc = band(pull16() + 1, 0xFFFF)
-end
-
-local function sbc()
-    local m = read_op()
-    local c = get_flag(FLAG_C) and 0 or 1
-    local diff = a - m - c
-    set_flag(FLAG_C, diff >= 0)
-    set_flag(FLAG_V, band(bxor(a, diff), bxor(a, m), 0x80) ~= 0)
-    a = set_zn(band(diff, 0xFF))
-end
-
-local function sec() set_flag(FLAG_C, true) end
-local function sed() set_flag(FLAG_D, true) end
-local function sei() set_flag(FLAG_I, true) end
-
-local function sta()
-    write_op(a)
-end
-
-local function stx()
-    write_op(x)
-end
-
-local function sty()
-    write_op(y)
-end
-
-local function tax()
-    x = set_zn(a)
-end
-
-local function tay()
-    y = set_zn(a)
-end
-
-local function tsx()
-    x = set_zn(sp)
-end
-
-local function txa()
-    a = set_zn(x)
-end
-
-local function txs()
-    sp = x
-end
-
-local function tya()
-    a = set_zn(y)
-end
-
-local function ill()
-end
-
-local opcodes = {
-    [0x00] = {brk, imp, 7}, [0x01] = {ora, izx, 6}, [0x05] = {ora, zp, 3},
-    [0x06] = {asl, zp, 5}, [0x08] = {php, imp, 3}, [0x09] = {ora, imm, 2},
-    [0x0A] = {asl_a, acc, 2}, [0x0D] = {ora, abs, 4}, [0x0E] = {asl, abs, 6},
-    [0x10] = {bpl, rel, 2}, [0x11] = {ora, izy, 5}, [0x15] = {ora, zpx, 4},
-    [0x16] = {asl, zpx, 6}, [0x18] = {clc, imp, 2}, [0x19] = {ora, aby, 4},
-    [0x1D] = {ora, abx, 4}, [0x1E] = {asl, abx, 7},
-    [0x20] = {jsr, abs, 6}, [0x21] = {op_and, izx, 6}, [0x24] = {op_bit, zp, 3},
-    [0x25] = {op_and, zp, 3}, [0x26] = {rol, zp, 5}, [0x28] = {plp, imp, 4},
-    [0x29] = {op_and, imm, 2}, [0x2A] = {rol_a, acc, 2}, [0x2C] = {op_bit, abs, 4},
-    [0x2D] = {op_and, abs, 4}, [0x2E] = {rol, abs, 6},
-    [0x30] = {bmi, rel, 2}, [0x31] = {op_and, izy, 5}, [0x35] = {op_and, zpx, 4},
-    [0x36] = {rol, zpx, 6}, [0x38] = {sec, imp, 2}, [0x39] = {op_and, aby, 4},
-    [0x3D] = {op_and, abx, 4}, [0x3E] = {rol, abx, 7},
-    [0x40] = {rti, imp, 6}, [0x41] = {eor, izx, 6}, [0x45] = {eor, zp, 3},
-    [0x46] = {lsr, zp, 5}, [0x48] = {pha, imp, 3}, [0x49] = {eor, imm, 2},
-    [0x4A] = {lsr_a, acc, 2}, [0x4C] = {jmp, abs, 3}, [0x4D] = {eor, abs, 4},
-    [0x4E] = {lsr, abs, 6},
-    [0x50] = {bvc, rel, 2}, [0x51] = {eor, izy, 5}, [0x55] = {eor, zpx, 4},
-    [0x56] = {lsr, zpx, 6}, [0x58] = {cli, imp, 2}, [0x59] = {eor, aby, 4},
-    [0x5D] = {eor, abx, 4}, [0x5E] = {lsr, abx, 7},
-    [0x60] = {rts, imp, 6}, [0x61] = {adc, izx, 6}, [0x65] = {adc, zp, 3},
-    [0x66] = {ror, zp, 5}, [0x68] = {pla, imp, 4}, [0x69] = {adc, imm, 2},
-    [0x6A] = {ror_a, acc, 2}, [0x6C] = {jmp, ind, 5}, [0x6D] = {adc, abs, 4},
-    [0x6E] = {ror, abs, 6},
-    [0x70] = {bvs, rel, 2}, [0x71] = {adc, izy, 5}, [0x75] = {adc, zpx, 4},
-    [0x76] = {ror, zpx, 6}, [0x78] = {sei, imp, 2}, [0x79] = {adc, aby, 4},
-    [0x7D] = {adc, abx, 4}, [0x7E] = {ror, abx, 7},
-    [0x81] = {sta, izx, 6}, [0x84] = {sty, zp, 3}, [0x85] = {sta, zp, 3},
-    [0x86] = {stx, zp, 3}, [0x88] = {dey, imp, 2}, [0x8A] = {txa, imp, 2},
-    [0x8C] = {sty, abs, 4}, [0x8D] = {sta, abs, 4}, [0x8E] = {stx, abs, 4},
-    [0x90] = {bcc, rel, 2}, [0x91] = {sta, izy, 6}, [0x94] = {sty, zpx, 4},
-    [0x95] = {sta, zpx, 4}, [0x96] = {stx, zpy, 4}, [0x98] = {tya, imp, 2},
-    [0x99] = {sta, aby, 5}, [0x9A] = {txs, imp, 2}, [0x9D] = {sta, abx, 5},
-    [0xA0] = {ldy, imm, 2}, [0xA1] = {lda, izx, 6}, [0xA2] = {ldx, imm, 2},
-    [0xA4] = {ldy, zp, 3}, [0xA5] = {lda, zp, 3}, [0xA6] = {ldx, zp, 3},
-    [0xA8] = {tay, imp, 2}, [0xA9] = {lda, imm, 2}, [0xAA] = {tax, imp, 2},
-    [0xAC] = {ldy, abs, 4}, [0xAD] = {lda, abs, 4}, [0xAE] = {ldx, abs, 4},
-    [0xB0] = {bcs, rel, 2}, [0xB1] = {lda, izy, 5}, [0xB4] = {ldy, zpx, 4},
-    [0xB5] = {lda, zpx, 4}, [0xB6] = {ldx, zpy, 4}, [0xB8] = {clv, imp, 2},
-    [0xB9] = {lda, aby, 4}, [0xBA] = {tsx, imp, 2}, [0xBC] = {ldy, abx, 4},
-    [0xBD] = {lda, abx, 4}, [0xBE] = {ldx, aby, 4},
-    [0xC0] = {cpy, imm, 2}, [0xC1] = {cmp, izx, 6}, [0xC4] = {cpy, zp, 3},
-    [0xC5] = {cmp, zp, 3}, [0xC6] = {dec, zp, 5}, [0xC8] = {iny, imp, 2},
-    [0xC9] = {cmp, imm, 2}, [0xCA] = {dex, imp, 2}, [0xCC] = {cpy, abs, 4},
-    [0xCD] = {cmp, abs, 4}, [0xCE] = {dec, abs, 6},
-    [0xD0] = {bne, rel, 2}, [0xD1] = {cmp, izy, 5}, [0xD5] = {cmp, zpx, 4},
-    [0xD6] = {dec, zpx, 6}, [0xD8] = {cld, imp, 2}, [0xD9] = {cmp, aby, 4},
-    [0xDD] = {cmp, abx, 4}, [0xDE] = {dec, abx, 7},
-    [0xE0] = {cpx, imm, 2}, [0xE1] = {sbc, izx, 6}, [0xE4] = {cpx, zp, 3},
-    [0xE5] = {sbc, zp, 3}, [0xE6] = {inc, zp, 5}, [0xE8] = {inx, imp, 2},
-    [0xE9] = {sbc, imm, 2}, [0xEA] = {nop, imp, 2}, [0xEC] = {cpx, abs, 4},
-    [0xED] = {sbc, abs, 4}, [0xEE] = {inc, abs, 6},
-    [0xF0] = {beq, rel, 2}, [0xF1] = {sbc, izy, 5}, [0xF5] = {sbc, zpx, 4},
-    [0xF6] = {inc, zpx, 6}, [0xF8] = {sed, imp, 2}, [0xF9] = {sbc, aby, 4},
-    [0xFD] = {sbc, abx, 4}, [0xFE] = {inc, abx, 7}
-}
+local op = {}
 
 for i = 0, 255 do
-    if not opcodes[i] then
-        opcodes[i] = {ill, imp, 2}
+    op[i] = function() return 2 end
+end
+
+op[0x00] = function()
+    pc = band(pc + 1, 0xFFFF)
+    push(rshift(pc, 8))
+    push(band(pc, 0xFF))
+    push(bor(status, FLAG_B, FLAG_U))
+    status = bor(status, FLAG_I)
+    pc = bor(bus_read(0xFFFE), lshift(bus_read(0xFFFF), 8))
+    return 7
+end
+
+op[0x01] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    a = bor(a, bus_read(bor(lo, lshift(hi, 8))))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 6
+end
+
+op[0x05] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    a = bor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 3
+end
+
+op[0x06] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(lshift(m, 1), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 5
+end
+
+op[0x08] = function()
+    push(bor(status, FLAG_B, FLAG_U))
+    return 3
+end
+
+op[0x09] = function()
+    a = bor(a, read_code(pc))
+    pc = band(pc + 1, 0xFFFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 2
+end
+
+op[0x0A] = function()
+    local new_c = band(a, 0x80) ~= 0 and FLAG_C or 0
+    a = band(lshift(a, 1), 0xFF)
+    status = bor(band(status, 0x3C), new_c, nz_flags[a])
+    return 2
+end
+
+op[0x0D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    a = bor(a, bus_read(bor(lo, lshift(hi, 8))))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x0E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = bor(lo, lshift(hi, 8))
+    local m = bus_read(addr)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(lshift(m, 1), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x10] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_N) == 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
     end
+    return 2
+end
+
+op[0x11] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    a = bor(a, bus_read(final))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 5 + extra
+end
+
+op[0x15] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    a = bor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x16] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(lshift(m, 1), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x18] = function()
+    status = band(status, 0xFE)
+    return 2
+end
+
+op[0x19] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = bor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0x1D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = bor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0x1E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    local m = bus_read(addr)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(lshift(m, 1), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 7
+end
+
+op[0x20] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    local ret = band(pc + 1, 0xFFFF)
+    push(rshift(ret, 8))
+    push(band(ret, 0xFF))
+    pc = bor(lo, lshift(hi, 8))
+    return 6
+end
+
+op[0x21] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    a = band(a, bus_read(bor(lo, lshift(hi, 8))))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 6
+end
+
+op[0x24] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local f = band(status, 0x3D)
+    if band(a, m) == 0 then f = bor(f, FLAG_Z) end
+    if band(m, 0x40) ~= 0 then f = bor(f, FLAG_V) end
+    if band(m, 0x80) ~= 0 then f = bor(f, FLAG_N) end
+    status = f
+    return 3
+end
+
+op[0x25] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    a = band(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 3
+end
+
+op[0x26] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(bor(lshift(m, 1), c), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 5
+end
+
+op[0x28] = function()
+    status = bor(band(pull(), 0xEF), FLAG_U)
+    return 4
+end
+
+op[0x29] = function()
+    a = band(a, read_code(pc))
+    pc = band(pc + 1, 0xFFFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 2
+end
+
+op[0x2A] = function()
+    local c = band(status, FLAG_C)
+    local new_c = band(a, 0x80) ~= 0 and FLAG_C or 0
+    a = band(bor(lshift(a, 1), c), 0xFF)
+    status = bor(band(status, 0x3C), new_c, nz_flags[a])
+    return 2
+end
+
+op[0x2C] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local f = band(status, 0x3D)
+    if band(a, m) == 0 then f = bor(f, FLAG_Z) end
+    if band(m, 0x40) ~= 0 then f = bor(f, FLAG_V) end
+    if band(m, 0x80) ~= 0 then f = bor(f, FLAG_N) end
+    status = f
+    return 4
+end
+
+op[0x2D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    a = band(a, bus_read(bor(lo, lshift(hi, 8))))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x2E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = bor(lo, lshift(hi, 8))
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(bor(lshift(m, 1), c), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x30] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_N) ~= 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0x31] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    a = band(a, bus_read(final))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 5 + extra
+end
+
+op[0x35] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    a = band(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x36] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(bor(lshift(m, 1), c), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x38] = function()
+    status = bor(status, FLAG_C)
+    return 2
+end
+
+op[0x39] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = band(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0x3D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = band(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0x3E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local new_c = band(m, 0x80) ~= 0 and FLAG_C or 0
+    m = band(bor(lshift(m, 1), c), 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 7
+end
+
+op[0x40] = function()
+    status = bor(band(pull(), 0xEF), FLAG_U)
+    local lo = pull()
+    local hi = pull()
+    pc = bor(lo, lshift(hi, 8))
+    return 6
+end
+
+op[0x41] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    a = bxor(a, bus_read(bor(lo, lshift(hi, 8))))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 6
+end
+
+op[0x45] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    a = bxor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 3
+end
+
+op[0x46] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = rshift(m, 1)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 5
+end
+
+op[0x48] = function()
+    push(a)
+    return 3
+end
+
+op[0x49] = function()
+    a = bxor(a, read_code(pc))
+    pc = band(pc + 1, 0xFFFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 2
+end
+
+op[0x4A] = function()
+    local new_c = band(a, 0x01) ~= 0 and FLAG_C or 0
+    a = rshift(a, 1)
+    status = bor(band(status, 0x3C), new_c, nz_flags[a])
+    return 2
+end
+
+op[0x4C] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = bor(lo, lshift(hi, 8))
+    return 3
+end
+
+op[0x4D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    a = bxor(a, bus_read(bor(lo, lshift(hi, 8))))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x4E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = bor(lo, lshift(hi, 8))
+    local m = bus_read(addr)
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = rshift(m, 1)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x50] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_V) == 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0x51] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    a = bxor(a, bus_read(final))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 5 + extra
+end
+
+op[0x55] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    a = bxor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x56] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = rshift(m, 1)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x58] = function()
+    status = band(status, 0xFB)
+    return 2
+end
+
+op[0x59] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = bxor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0x5D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = bxor(a, bus_read(addr))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0x5E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    local m = bus_read(addr)
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = rshift(m, 1)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 7
+end
+
+op[0x60] = function()
+    local lo = pull()
+    local hi = pull()
+    pc = band(bor(lo, lshift(hi, 8)) + 1, 0xFFFF)
+    return 6
+end
+
+op[0x61] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 6
+end
+
+op[0x65] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 3
+end
+
+op[0x66] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0x80 or 0
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = bor(rshift(m, 1), c)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 5
+end
+
+op[0x68] = function()
+    a = pull()
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0x69] = function()
+    local m = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 2
+end
+
+op[0x6A] = function()
+    local c = band(status, FLAG_C) ~= 0 and 0x80 or 0
+    local new_c = band(a, 0x01) ~= 0 and FLAG_C or 0
+    a = bor(rshift(a, 1), c)
+    status = bor(band(status, 0x3C), new_c, nz_flags[a])
+    return 2
+end
+
+op[0x6C] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    local ptr = bor(lo, lshift(hi, 8))
+    local plo = bus_read(ptr)
+    local phi = bus_read(bor(band(ptr, 0xFF00), band(ptr + 1, 0x00FF)))
+    pc = bor(plo, lshift(phi, 8))
+    return 5
+end
+
+op[0x6D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4
+end
+
+op[0x6E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = bor(lo, lshift(hi, 8))
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0x80 or 0
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = bor(rshift(m, 1), c)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x70] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_V) ~= 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0x71] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    local m = bus_read(final)
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 5 + extra
+end
+
+op[0x75] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4
+end
+
+op[0x76] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0x80 or 0
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = bor(rshift(m, 1), c)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 6
+end
+
+op[0x78] = function()
+    status = bor(status, FLAG_I)
+    return 2
+end
+
+op[0x79] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4 + extra
+end
+
+op[0x7D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C)
+    local sum = a + m + c
+    local result = band(sum, 0xFF)
+    local f = sum > 255 and FLAG_C or 0
+    if band(bxor(a, result), bxor(m, result), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4 + extra
+end
+
+op[0x7E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0x80 or 0
+    local new_c = band(m, 0x01) ~= 0 and FLAG_C or 0
+    m = bor(rshift(m, 1), c)
+    bus_write(addr, m)
+    status = bor(band(status, 0x3C), new_c, nz_flags[m])
+    return 7
+end
+
+op[0x81] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    bus_write(bor(lo, lshift(hi, 8)), a)
+    return 6
+end
+
+op[0x84] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    bus_write(addr, y)
+    return 3
+end
+
+op[0x85] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    bus_write(addr, a)
+    return 3
+end
+
+op[0x86] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    bus_write(addr, x)
+    return 3
+end
+
+op[0x88] = function()
+    y = band(y - 1, 0xFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 2
+end
+
+op[0x8A] = function()
+    a = x
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 2
+end
+
+op[0x8C] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    bus_write(bor(lo, lshift(hi, 8)), y)
+    return 4
+end
+
+op[0x8D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    bus_write(bor(lo, lshift(hi, 8)), a)
+    return 4
+end
+
+op[0x8E] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    bus_write(bor(lo, lshift(hi, 8)), x)
+    return 4
+end
+
+op[0x90] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_C) == 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0x91] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = band(bor(lo, lshift(hi, 8)) + y, 0xFFFF)
+    bus_write(addr, a)
+    return 6
+end
+
+op[0x94] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    bus_write(addr, y)
+    return 4
+end
+
+op[0x95] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    bus_write(addr, a)
+    return 4
+end
+
+op[0x96] = function()
+    local addr = band(read_code(pc) + y, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    bus_write(addr, x)
+    return 4
+end
+
+op[0x98] = function()
+    a = y
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 2
+end
+
+op[0x99] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + y, 0xFFFF)
+    bus_write(addr, a)
+    return 5
+end
+
+op[0x9A] = function()
+    sp = x
+    return 2
+end
+
+op[0x9D] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    bus_write(addr, a)
+    return 5
+end
+
+op[0xA0] = function()
+    y = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 2
+end
+
+op[0xA1] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    a = bus_read(bor(lo, lshift(hi, 8)))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 6
+end
+
+op[0xA2] = function()
+    x = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 2
+end
+
+op[0xA4] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    y = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 3
+end
+
+op[0xA5] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    a = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 3
+end
+
+op[0xA6] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    x = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 3
+end
+
+op[0xA8] = function()
+    y = a
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 2
+end
+
+op[0xA9] = function()
+    a = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 2
+end
+
+op[0xAA] = function()
+    x = a
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 2
+end
+
+op[0xAC] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    y = bus_read(bor(lo, lshift(hi, 8)))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 4
+end
+
+op[0xAD] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    a = bus_read(bor(lo, lshift(hi, 8)))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0xAE] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    x = bus_read(bor(lo, lshift(hi, 8)))
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 4
+end
+
+op[0xB0] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_C) ~= 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0xB1] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    a = bus_read(final)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 5 + extra
+end
+
+op[0xB4] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    y = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 4
+end
+
+op[0xB5] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    a = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4
+end
+
+op[0xB6] = function()
+    local addr = band(read_code(pc) + y, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    x = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 4
+end
+
+op[0xB8] = function()
+    status = band(status, 0xBF)
+    return 2
+end
+
+op[0xB9] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0xBA] = function()
+    x = sp
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 2
+end
+
+op[0xBC] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    y = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 4 + extra
+end
+
+op[0xBD] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    a = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[a])
+    return 4 + extra
+end
+
+op[0xBE] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    x = bus_read(addr)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 4 + extra
+end
+
+op[0xC0] = function()
+    local m = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local result = band(y - m, 0xFF)
+    local f = y >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 2
+end
+
+op[0xC1] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 6
+end
+
+op[0xC4] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local result = band(y - m, 0xFF)
+    local f = y >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 3
+end
+
+op[0xC5] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 3
+end
+
+op[0xC6] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = band(bus_read(addr) - 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 5
+end
+
+op[0xC8] = function()
+    y = band(y + 1, 0xFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[y])
+    return 2
+end
+
+op[0xC9] = function()
+    local m = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 2
+end
+
+op[0xCA] = function()
+    x = band(x - 1, 0xFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 2
+end
+
+op[0xCC] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local result = band(y - m, 0xFF)
+    local f = y >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 4
+end
+
+op[0xCD] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 4
+end
+
+op[0xCE] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = bor(lo, lshift(hi, 8))
+    local m = band(bus_read(addr) - 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 6
+end
+
+op[0xD0] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_Z) == 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0xD1] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    local m = bus_read(final)
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 5 + extra
+end
+
+op[0xD5] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 4
+end
+
+op[0xD6] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = band(bus_read(addr) - 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 6
+end
+
+op[0xD8] = function()
+    status = band(status, 0xF7)
+    return 2
+end
+
+op[0xD9] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    local m = bus_read(addr)
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 4 + extra
+end
+
+op[0xDD] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    local m = bus_read(addr)
+    local result = band(a - m, 0xFF)
+    local f = a >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 4 + extra
+end
+
+op[0xDE] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    local m = band(bus_read(addr) - 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 7
+end
+
+op[0xE0] = function()
+    local m = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local result = band(x - m, 0xFF)
+    local f = x >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 2
+end
+
+op[0xE1] = function()
+    local base = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 6
+end
+
+op[0xE4] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local result = band(x - m, 0xFF)
+    local f = x >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 3
+end
+
+op[0xE5] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 3
+end
+
+op[0xE6] = function()
+    local addr = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local m = band(bus_read(addr) + 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 5
+end
+
+op[0xE8] = function()
+    x = band(x + 1, 0xFF)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[x])
+    return 2
+end
+
+op[0xE9] = function()
+    local m = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 2
+end
+
+op[0xEA] = function()
+    return 2
+end
+
+op[0xEC] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local result = band(x - m, 0xFF)
+    local f = x >= m and FLAG_C or 0
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    return 4
+end
+
+op[0xED] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local m = bus_read(bor(lo, lshift(hi, 8)))
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4
+end
+
+op[0xEE] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = bor(lo, lshift(hi, 8))
+    local m = band(bus_read(addr) + 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 6
+end
+
+op[0xF0] = function()
+    local offset = signed_offset[read_code(pc)]
+    pc = band(pc + 1, 0xFFFF)
+    if band(status, FLAG_Z) ~= 0 then
+        local target = band(pc + offset, 0xFFFF)
+        local extra = band(pc, 0xFF00) ~= band(target, 0xFF00) and 2 or 1
+        pc = target
+        return 2 + extra
+    end
+    return 2
+end
+
+op[0xF1] = function()
+    local base = read_code(pc)
+    pc = band(pc + 1, 0xFFFF)
+    local lo = bus_read(base)
+    local hi = bus_read(band(base + 1, 0xFF))
+    local addr = bor(lo, lshift(hi, 8))
+    local final = band(addr + y, 0xFFFF)
+    local extra = band(addr, 0xFF00) ~= band(final, 0xFF00) and 1 or 0
+    local m = bus_read(final)
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 5 + extra
+end
+
+op[0xF5] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4
+end
+
+op[0xF6] = function()
+    local addr = band(read_code(pc) + x, 0xFF)
+    pc = band(pc + 1, 0xFFFF)
+    local m = band(bus_read(addr) + 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 6
+end
+
+op[0xF8] = function()
+    status = bor(status, FLAG_D)
+    return 2
+end
+
+op[0xF9] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + y, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4 + extra
+end
+
+op[0xFD] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local base = bor(lo, lshift(hi, 8))
+    local addr = band(base + x, 0xFFFF)
+    local extra = band(base, 0xFF00) ~= band(addr, 0xFF00) and 1 or 0
+    local m = bus_read(addr)
+    local c = band(status, FLAG_C) ~= 0 and 0 or 1
+    local diff = a - m - c
+    local result = band(diff, 0xFF)
+    local f = diff >= 0 and FLAG_C or 0
+    if band(bxor(a, result), bxor(a, m), 0x80) ~= 0 then f = bor(f, FLAG_V) end
+    status = bor(band(status, 0x0C), f, nz_flags[result])
+    a = result
+    return 4 + extra
+end
+
+op[0xFE] = function()
+    local lo = read_code(pc)
+    local hi = read_code(pc + 1)
+    pc = band(pc + 2, 0xFFFF)
+    local addr = band(bor(lo, lshift(hi, 8)) + x, 0xFFFF)
+    local m = band(bus_read(addr) + 1, 0xFF)
+    bus_write(addr, m)
+    status = bor(band(status, FLAG_NZ_CLEAR), nz_flags[m])
+    return 7
 end
 
 function cpu.init(b)
     bus = b
-    a = 0
-    x = 0
-    y = 0
+    bus_read = b.read
+    bus_write = b.write
+    bus_get_dma_cycles = b.get_dma_cycles
+    prg_rom = structs.prg_rom
+    prg_mask = structs.prg_mask
+    a, x, y = 0, 0, 0
     sp = 0xFD
     status = bor(FLAG_U, FLAG_I)
-    pc = bus.read16(0xFFFC)
-    cycles = 0
+    pc = bor(bus_read(0xFFFC), lshift(bus_read(0xFFFD), 8))
 end
 
 function cpu.reset()
     sp = band(sp - 3, 0xFF)
-    set_flag(FLAG_I, true)
-    pc = bus.read16(0xFFFC)
+    status = bor(status, FLAG_I)
+    pc = bor(bus_read(0xFFFC), lshift(bus_read(0xFFFD), 8))
 end
 
 function cpu.nmi()
-    push16(pc)
+    push(rshift(pc, 8))
+    push(band(pc, 0xFF))
     push(band(status, bxor(0xFF, FLAG_B)))
-    set_flag(FLAG_I, true)
-    pc = bus.read16(0xFFFA)
-    cycles = cycles + 7
+    status = bor(status, FLAG_I)
+    pc = bor(bus_read(0xFFFA), lshift(bus_read(0xFFFB), 8))
 end
 
 function cpu.irq()
-    if not get_flag(FLAG_I) then
-        push16(pc)
+    if band(status, FLAG_I) == 0 then
+        push(rshift(pc, 8))
+        push(band(pc, 0xFF))
         push(band(status, bxor(0xFF, FLAG_B)))
-        set_flag(FLAG_I, true)
-        pc = bus.read16(0xFFFE)
-        cycles = cycles + 7
+        status = bor(status, FLAG_I)
+        pc = bor(bus_read(0xFFFE), lshift(bus_read(0xFFFF), 8))
     end
 end
 
 function cpu.step()
-    local opcode = bus.read(pc)
+    local opcode = read_code(pc)
     pc = band(pc + 1, 0xFFFF)
-
-    local op = opcodes[opcode]
-    local exec, mode, base_cycles = op[1], op[2], op[3]
-
-    page_crossed = false
-    mode()
-    exec()
-
-    cycles = base_cycles
-    if page_crossed and (opcode == 0x11 or opcode == 0x19 or opcode == 0x1D or
-                         opcode == 0x31 or opcode == 0x39 or opcode == 0x3D or
-                         opcode == 0x51 or opcode == 0x59 or opcode == 0x5D or
-                         opcode == 0x71 or opcode == 0x79 or opcode == 0x7D or
-                         opcode == 0xB1 or opcode == 0xB9 or opcode == 0xBD or
-                         opcode == 0xBE or opcode == 0xBC or
-                         opcode == 0xD1 or opcode == 0xD9 or opcode == 0xDD or
-                         opcode == 0xF1 or opcode == 0xF9 or opcode == 0xFD) then
-        cycles = cycles + 1
-    end
-
-    local dma = bus.get_dma_cycles()
-    cycles = cycles + dma
-
-    return cycles
+    return op[opcode]() + bus_get_dma_cycles()
 end
 
 function cpu.get_pc()

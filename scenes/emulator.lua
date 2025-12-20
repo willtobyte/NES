@@ -9,9 +9,14 @@ local SCANLINES_PER_FRAME = 262
 
 local scene = {}
 
-function scene.on_enter()
-    local f  = io.open("donkeykong.nes", "rb")
+local cpu_step = cpu.step
+local cpu_nmi = cpu.nmi
+local ppu_run_scanline = ppu.run_scanline
+local ppu_get_framebuffer = ppu.get_framebuffer
+local input_poll = input.poll
 
+function scene.on_enter()
+    local f = io.open("donkeykong.nes", "rb")
     local data = f:read("*a")
     f:close()
 
@@ -23,20 +28,20 @@ function scene.on_enter()
 end
 
 function scene.on_loop()
-    input.poll(keyboard)
+    input_poll(keyboard)
 
     for _ = 1, SCANLINES_PER_FRAME do
         local cycles = 0
         while cycles < CYCLES_PER_SCANLINE do
-            cycles = cycles + cpu.step()
+            cycles = cycles + cpu_step()
         end
 
-        if ppu.run_scanline() then
-            cpu.nmi()
+        if ppu_run_scanline() then
+            cpu_nmi()
         end
     end
 
-    canvas.pixels = ppu.get_framebuffer()
+    canvas.pixels = ppu_get_framebuffer()
 end
 
 sentinel(scene, "emulator")

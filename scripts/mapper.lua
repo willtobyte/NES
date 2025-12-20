@@ -1,13 +1,14 @@
 local bit = require("bit")
-local band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift
+local band, bor, rshift = bit.band, bit.bor, bit.rshift
 local byte = string.byte
+local structs = require("ffi_structs")
+local ffi_copy, ffi_fill = structs.copy, structs.fill
 
 local mapper = {}
 
-local prg_rom
-local chr_rom
-local prg_banks
-local chr_banks
+local prg_rom, chr_rom
+local prg_size, chr_size
+local prg_mask, chr_mask
 local mirroring
 
 function mapper.load(data)
@@ -16,8 +17,8 @@ function mapper.load(data)
         error("Invalid iNES header")
     end
 
-    prg_banks = byte(data, 5)
-    chr_banks = byte(data, 6)
+    local prg_banks = byte(data, 5)
+    local chr_banks = byte(data, 6)
     local flags6 = byte(data, 7)
     local flags7 = byte(data, 8)
 
@@ -32,24 +33,23 @@ function mapper.load(data)
     local offset = 17
     if has_trainer then offset = offset + 512 end
 
-    local prg_size = prg_banks * 16384
-    prg_rom = {}
-    for i = 0, prg_size - 1 do
-        prg_rom[i] = byte(data, offset + i)
-    end
-    offset = offset + prg_size
+    prg_size = prg_banks * 16384
+    prg_mask = prg_banks == 1 and 0x3FFF or 0x7FFF
+    chr_size = chr_banks * 8192
+    if chr_size == 0 then chr_size = 8192 end
 
-    local chr_size = chr_banks * 8192
-    chr_rom = {}
-    if chr_size == 0 then
-        chr_size = 8192
-        for i = 0, chr_size - 1 do
-            chr_rom[i] = 0
-        end
+    prg_rom, chr_rom = structs.alloc_rom(prg_size, chr_size)
+    chr_mask = chr_size - 1
+
+    structs.set_prg_mask(prg_mask)
+
+    ffi_copy(prg_rom, data:sub(offset, offset + prg_size - 1), prg_size)
+
+    if chr_banks > 0 then
+        local chr_offset = offset + prg_size
+        ffi_copy(chr_rom, data:sub(chr_offset, chr_offset + chr_size - 1), chr_size)
     else
-        for i = 0, chr_size - 1 do
-            chr_rom[i] = byte(data, offset + i)
-        end
+        ffi_fill(chr_rom, chr_size, 0)
     end
 
     return {
@@ -60,26 +60,25 @@ function mapper.load(data)
 end
 
 function mapper.prg_read(addr)
-    local offset
-    if prg_banks == 1 then
-        offset = band(addr, 0x3FFF)
-    else
-        offset = band(addr, 0x7FFF)
-    end
-    return prg_rom[offset] or 0
+    return prg_rom[band(addr, prg_mask)]
 end
 
-function mapper.prg_write(addr, value)
-end
+function mapper.prg_write(addr, value) end
 
 function mapper.chr_read(addr)
-    return chr_rom[band(addr, 0x1FFF)] or 0
+    return chr_rom[band(addr, chr_mask)]
 end
 
 function mapper.chr_write(addr, value)
-    if chr_banks == 0 then
-        chr_rom[band(addr, 0x1FFF)] = value
-    end
+    chr_rom[band(addr, chr_mask)] = value
+end
+
+function mapper.get_chr_rom()
+    return chr_rom, chr_mask
+end
+
+function mapper.get_mirroring()
+    return mirroring
 end
 
 function mapper.mirror_nametable(addr)

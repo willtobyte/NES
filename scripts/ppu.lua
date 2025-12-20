@@ -1,54 +1,41 @@
 local bit = require("bit")
 local band, bor, bxor, lshift, rshift = bit.band, bit.bor, bit.bxor, bit.lshift, bit.rshift
-local char, concat = string.char, table.concat
+local structs = require("ffi_structs")
+local ffi = structs.ffi
+local ffi_fill = ffi.fill
 
 local ppu = {}
 
 local mapper
-local vram = {}
-local palette = {}
-local oam = {}
+local vram = structs.vram
+local palette = structs.palette
+local oam = structs.oam
+local nes_rgb = structs.nes_rgb
+local framebuffer = structs.framebuffer
+local palette_mirror = structs.palette_mirror
+local bit_lut = structs.bit_lut
+local nes_rgb_u32 = structs.nes_rgb_u32
+local fb_u32 = structs.fb_u32
 
-for i = 0, 2047 do vram[i] = 0 end
-for i = 0, 31 do palette[i] = 0 end
-for i = 0, 255 do oam[i] = 0 end
+local ctrl, mask, status, oam_addr, data_buffer
+local v, t, fine_x, w
+local scanline
+local frame_ready
+local nmi_occurred, nmi_output
 
-local ctrl = 0
-local mask = 0
-local status = 0
-local oam_addr = 0
-local data_buffer = 0
-local v = 0
-local t = 0
-local fine_x = 0
-local w = 0
-local scanline = 0
-local frame_ready = false
+local chr_rom, chr_mask
+local mirroring
 
-local nmi_occurred = false
-local nmi_output = false
-
-local nes_rgb = {}
-local raw_palette = {
-    0x626262, 0x001FB2, 0x2404C8, 0x5200B2, 0x730076, 0x800024, 0x730B00, 0x522800,
-    0x244400, 0x005700, 0x005C00, 0x005324, 0x003C76, 0x000000, 0x000000, 0x000000,
-    0xABABAB, 0x0D57FF, 0x4B30FF, 0x8A13FF, 0xBC08D6, 0xD21269, 0xC72E00, 0x9D5400,
-    0x607B00, 0x209800, 0x00A300, 0x009942, 0x007DB4, 0x000000, 0x000000, 0x000000,
-    0xFFFFFF, 0x53AEFF, 0x9085FF, 0xD365FF, 0xFF57FF, 0xFF5DCF, 0xFF7757, 0xFA9E00,
-    0xBDC700, 0x7AE700, 0x43F611, 0x26EF7E, 0x2CD5F6, 0x4E4E4E, 0x000000, 0x000000,
-    0xFFFFFF, 0xB6E1FF, 0xCED1FF, 0xE9C3FF, 0xFFBCFF, 0xFFBDF4, 0xFFC6C3, 0xFFD59A,
-    0xE9E681, 0xCEF481, 0xB6FB9A, 0xA9FAC3, 0xA9F0F4, 0xB8B8B8, 0x000000, 0x000000
-}
-for i = 0, 63 do
-    local c = raw_palette[i + 1]
-    nes_rgb[i] = char(band(rshift(c, 16), 0xFF), band(rshift(c, 8), 0xFF), band(c, 0xFF), 255)
+local function mirror_nt_h(addr)
+    return band(addr, 0x07FF)
 end
-local black = char(0, 0, 0, 255)
 
-local row_pixels = {}
-local rows = {}
-for i = 1, 256 do row_pixels[i] = black end
-for i = 1, 240 do rows[i] = "" end
+local function mirror_nt_v(addr)
+    local offset = band(addr, 0x0FFF)
+    return offset < 0x0800 and band(offset, 0x03FF) or (0x0400 + band(offset, 0x03FF))
+end
+
+local mirror_nt = mirror_nt_h
 
 function ppu.init(m)
     mapper = m
@@ -56,31 +43,34 @@ function ppu.init(m)
     v, t, fine_x, w = 0, 0, 0, 0
     scanline, frame_ready = 0, false
     nmi_occurred, nmi_output = false, false
+    ffi_fill(vram, 2048, 0)
+    ffi_fill(palette, 32, 0)
+    ffi_fill(oam, 256, 0)
+
+    chr_rom, chr_mask = m.get_chr_rom()
+    mirroring = m.get_mirroring()
+    mirror_nt = mirroring == 0 and mirror_nt_h or mirror_nt_v
 end
 
 local function ppu_read(addr)
     addr = band(addr, 0x3FFF)
     if addr < 0x2000 then
-        return mapper.chr_read(addr)
+        return chr_rom[band(addr, chr_mask)]
     elseif addr < 0x3F00 then
-        return vram[mapper.mirror_nametable(addr)]
+        return vram[mirror_nt(addr)]
     else
-        local pa = band(addr, 0x1F)
-        if pa == 0x10 or pa == 0x14 or pa == 0x18 or pa == 0x1C then pa = pa - 0x10 end
-        return palette[pa]
+        return palette[palette_mirror[band(addr, 0x1F)]]
     end
 end
 
 local function ppu_write(addr, val)
     addr = band(addr, 0x3FFF)
     if addr < 0x2000 then
-        mapper.chr_write(addr, val)
+        chr_rom[band(addr, chr_mask)] = val
     elseif addr < 0x3F00 then
-        vram[mapper.mirror_nametable(addr)] = val
+        vram[mirror_nt(addr)] = val
     else
-        local pa = band(addr, 0x1F)
-        if pa == 0x10 or pa == 0x14 or pa == 0x18 or pa == 0x1C then pa = pa - 0x10 end
-        palette[pa] = val
+        palette[palette_mirror[band(addr, 0x1F)]] = val
     end
 end
 
@@ -142,117 +132,157 @@ end
 function ppu.get_oam_addr() return oam_addr end
 function ppu.oam_write(addr, val) oam[addr] = val end
 
+local sp_line_pixel = ffi.new("uint8_t[256]")
+local sp_line_pal = ffi.new("uint8_t[256]")
+local sp_line_behind = ffi.new("bool[256]")
+local sp_line_zero = ffi.new("bool[256]")
+local bg_line_pixel = ffi.new("uint8_t[256]")
+local bg_line_pal = ffi.new("uint8_t[256]")
+
 local function render_scanline(y)
-    if band(mask, 0x18) == 0 then
-        local bg = nes_rgb[palette[0]] or black
-        for x = 1, 256 do row_pixels[x] = bg end
-        rows[y + 1] = concat(row_pixels)
+    local mask_val = mask
+
+    if band(mask_val, 0x18) == 0 then
+        local color_u32 = nes_rgb_u32[palette[0]]
+        local base = y * 256
+        for px = 0, 255 do
+            fb_u32[base + px] = color_u32
+        end
         return
     end
 
-    local show_bg = band(mask, 0x08) ~= 0
-    local show_sp = band(mask, 0x10) ~= 0
-    local bg_left = band(mask, 0x02) ~= 0
-    local sp_left = band(mask, 0x04) ~= 0
+    local show_bg = band(mask_val, 0x08) ~= 0
+    local show_sp = band(mask_val, 0x10) ~= 0
+    local bg_left = band(mask_val, 0x02) ~= 0
+    local sp_left = band(mask_val, 0x04) ~= 0
 
-    local tile_y = band(rshift(v, 5), 0x1F)
-    local fine_y = band(rshift(v, 12), 0x07)
-    local nt_select = band(rshift(v, 10), 0x03)
-    local tile_x = band(v, 0x1F)
-    local pattern_base = band(ctrl, 0x10) ~= 0 and 0x1000 or 0
-    local sp_pattern_base = band(ctrl, 0x08) ~= 0 and 0x1000 or 0
-    local sprite_height = band(ctrl, 0x20) ~= 0 and 16 or 8
+    local v_val = v
+    local tile_y = band(rshift(v_val, 5), 0x1F)
+    local fine_y_val = band(rshift(v_val, 12), 0x07)
+    local nt_select = band(rshift(v_val, 10), 0x03)
+    local tile_x_start = band(v_val, 0x1F)
+    local ctrl_val = ctrl
+    local pattern_base = band(ctrl_val, 0x10) ~= 0 and 0x1000 or 0
+    local sp_pattern_base = band(ctrl_val, 0x08) ~= 0 and 0x1000 or 0
+    local sprite_height = band(ctrl_val, 0x20) ~= 0 and 16 or 8
 
-    local sprites = {}
-    local sprite_count = 0
+    local has_sprites = false
     if show_sp then
+        ffi_fill(sp_line_pixel, 256, 0)
+        local cm = chr_mask
+        local sp_count = 0
         for i = 0, 63 do
-            local sy = oam[i * 4]
+            local base = i * 4
+            local sy = oam[base]
             local row = y - sy
-            if row >= 0 and row < sprite_height and sprite_count < 8 then
-                local tile = oam[i * 4 + 1]
-                local attr = oam[i * 4 + 2]
-                local sx = oam[i * 4 + 3]
-                local flip_v = band(attr, 0x80) ~= 0
-                local flip_h = band(attr, 0x40) ~= 0
-                local behind = band(attr, 0x20) ~= 0
-                local pal_idx = band(attr, 3) + 4
+            if row >= 0 and row < sprite_height then
+                sp_count = sp_count + 1
+                if sp_count <= 8 then
+                    local tile = oam[base + 1]
+                    local attr = oam[base + 2]
+                    local sx = oam[base + 3]
+                    local flip_v = band(attr, 0x80) ~= 0
+                    local flip_h = band(attr, 0x40) ~= 0
+                    local behind = band(attr, 0x20) ~= 0
+                    local pal_val = band(attr, 3) + 4
+                    local is_zero = i == 0
 
-                local r = flip_v and (sprite_height - 1 - row) or row
-                local pb, ti = sp_pattern_base, tile
-                if sprite_height == 16 then
-                    pb = band(tile, 1) ~= 0 and 0x1000 or 0
-                    ti = band(tile, 0xFE)
-                    if r >= 8 then ti, r = ti + 1, r - 8 end
+                    local r = flip_v and (sprite_height - 1 - row) or row
+                    local pb, ti = sp_pattern_base, tile
+                    if sprite_height == 16 then
+                        pb = band(tile, 1) ~= 0 and 0x1000 or 0
+                        ti = band(tile, 0xFE)
+                        if r >= 8 then ti, r = ti + 1, r - 8 end
+                    end
+
+                    local addr = pb + ti * 16 + r
+                    local low = chr_rom[band(addr, cm)]
+                    local high = chr_rom[band(addr + 8, cm)]
+
+                    local pixels = bit_lut[low][high]
+                    for b = 0, 7 do
+                        local px = sx + b
+                        if px < 256 and sp_line_pixel[px] == 0 then
+                            local pix = pixels[flip_h and (7 - b) or b]
+                            if pix ~= 0 then
+                                sp_line_pixel[px] = pix
+                                sp_line_pal[px] = pal_val
+                                sp_line_behind[px] = behind
+                                sp_line_zero[px] = is_zero
+                                has_sprites = true
+                            end
+                        end
+                    end
                 end
-
-                local addr = pb + ti * 16 + r
-                local low, high = ppu_read(addr), ppu_read(addr + 8)
-
-                sprite_count = sprite_count + 1
-                sprites[sprite_count] = {sx, low, high, flip_h, behind, pal_idx, i == 0}
             end
         end
     end
 
     local bg_color = palette[0]
-    for px = 0, 255 do
-        local x = px + 1
-        local bg_pixel, bg_pal = 0, 0
+    local bg_start = bg_left and 0 or 8
+    local sp_start = sp_left and 0 or 8
 
-        if show_bg and (px >= 8 or bg_left) then
-            local tx = tile_x + rshift(px + fine_x, 3)
+    if show_bg then
+        ffi_fill(bg_line_pixel, 256, 0)
+        local fx = fine_x
+        local num_tiles = fx == 0 and 32 or 33
+        local tile_y_32 = tile_y * 32
+        local attr_row = lshift(rshift(tile_y, 2), 3)
+        local attr_y_shift = lshift(band(tile_y, 2), 1)
+        local cm = chr_mask
+
+        for ti = 0, num_tiles do
+            local tx = tile_x_start + ti
             local nt = nt_select
-            if tx >= 32 then tx, nt = tx - 32, bxor(nt, 1) end
+            while tx >= 32 do tx, nt = tx - 32, bxor(nt, 1) end
 
-            local nt_addr = 0x2000 + lshift(nt, 10) + tile_y * 32 + tx
-            local tile = ppu_read(nt_addr)
-            local pa = pattern_base + tile * 16 + fine_y
-            local low, high = ppu_read(pa), ppu_read(pa + 8)
+            local nt_off = mirror_nt(0x2000 + lshift(nt, 10) + tile_y_32 + tx)
+            local tile = vram[nt_off]
+            local pa = pattern_base + tile * 16 + fine_y_val
+            local low = chr_rom[band(pa, cm)]
+            local high = chr_rom[band(pa + 8, cm)]
 
-            local bit_pos = 7 - band(px + fine_x, 7)
-            bg_pixel = bor(band(rshift(low, bit_pos), 1), lshift(band(rshift(high, bit_pos), 1), 1))
+            local attr_off = mirror_nt(0x23C0 + lshift(nt, 10) + attr_row + rshift(tx, 2))
+            local attr_val = vram[attr_off]
+            local shift = bor(band(tx, 2), attr_y_shift)
+            local pal_idx = band(rshift(attr_val, shift), 3)
 
-            if bg_pixel ~= 0 then
-                local attr_addr = 0x23C0 + lshift(nt, 10) + lshift(rshift(tile_y, 2), 3) + rshift(tx, 2)
-                local attr = ppu_read(attr_addr)
-                local shift = bor(band(tx, 2), lshift(band(tile_y, 2), 1))
-                bg_pal = band(rshift(attr, shift), 3)
-            end
-        end
-
-        local sp_pixel, sp_pal, sp_behind, sp_zero = 0, 0, false, false
-        if show_sp and (px >= 8 or sp_left) then
-            for si = 1, sprite_count do
-                local sp = sprites[si]
-                local offset = px - sp[1]
-                if offset >= 0 and offset < 8 then
-                    local bit_pos = sp[4] and offset or (7 - offset)
-                    local pix = bor(band(rshift(sp[2], bit_pos), 1), lshift(band(rshift(sp[3], bit_pos), 1), 1))
+            local base_px = ti * 8 - fx
+            local pixels = bit_lut[low][high]
+            for b = 0, 7 do
+                local px = base_px + b
+                if px >= bg_start and px < 256 then
+                    local pix = pixels[b]
                     if pix ~= 0 then
-                        sp_pixel, sp_pal, sp_behind, sp_zero = pix, sp[6], sp[5], sp[7]
-                        break
+                        bg_line_pixel[px] = pix
+                        bg_line_pal[px] = pal_idx
                     end
                 end
             end
         end
+    else
+        ffi_fill(bg_line_pixel, 256, 0)
+    end
+
+    local fb_base = y * 256
+    for px = 0, 255 do
+        local bg_pixel = bg_line_pixel[px]
+        local sp_pixel = has_sprites and px >= sp_start and sp_line_pixel[px] or 0
 
         local final_color
         if bg_pixel == 0 and sp_pixel == 0 then
             final_color = bg_color
         elseif bg_pixel == 0 then
-            final_color = palette[sp_pal * 4 + sp_pixel]
+            final_color = palette[sp_line_pal[px] * 4 + sp_pixel]
         elseif sp_pixel == 0 then
-            final_color = palette[bg_pal * 4 + bg_pixel]
+            final_color = palette[bg_line_pal[px] * 4 + bg_pixel]
         else
-            if sp_zero and px < 255 then status = bor(status, 0x40) end
-            final_color = sp_behind and palette[bg_pal * 4 + bg_pixel] or palette[sp_pal * 4 + sp_pixel]
+            if sp_line_zero[px] and px < 255 then status = bor(status, 0x40) end
+            final_color = sp_line_behind[px] and palette[bg_line_pal[px] * 4 + bg_pixel] or palette[sp_line_pal[px] * 4 + sp_pixel]
         end
 
-        row_pixels[x] = nes_rgb[band(final_color, 0x3F)] or black
+        fb_u32[fb_base + px] = nes_rgb_u32[band(final_color, 0x3F)]
     end
-
-    rows[y + 1] = concat(row_pixels)
 
     if band(v, 0x7000) ~= 0x7000 then
         v = v + 0x1000
@@ -292,7 +322,15 @@ end
 
 function ppu.nmi_pending() return nmi_occurred and nmi_output end
 function ppu.clear_nmi() nmi_occurred = false end
-function ppu.get_framebuffer() return concat(rows) end
-function ppu.frame_complete() local r = frame_ready; frame_ready = false; return r end
+
+function ppu.get_framebuffer()
+    return structs.string(framebuffer, 240 * 256 * 4)
+end
+
+function ppu.frame_complete()
+    local r = frame_ready
+    frame_ready = false
+    return r
+end
 
 return ppu

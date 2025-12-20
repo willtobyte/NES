@@ -16,16 +16,17 @@ local BTN_DOWN   = 0x20
 local BTN_LEFT   = 0x40
 local BTN_RIGHT  = 0x80
 
-function input.poll(keyboard)
-    buttons = 0
-    if keyboard.z then buttons = bor(buttons, BTN_A) end
-    if keyboard.x then buttons = bor(buttons, BTN_B) end
-    if keyboard.space then buttons = bor(buttons, BTN_SELECT) end
-    if keyboard.enter then buttons = bor(buttons, BTN_START) end
-    if keyboard.up then buttons = bor(buttons, BTN_UP) end
-    if keyboard.down then buttons = bor(buttons, BTN_DOWN) end
-    if keyboard.left then buttons = bor(buttons, BTN_LEFT) end
-    if keyboard.right then buttons = bor(buttons, BTN_RIGHT) end
+function input.poll(kb)
+    local b = 0
+    if kb.z then b = bor(b, BTN_A) end
+    if kb.x then b = bor(b, BTN_B) end
+    if kb.space then b = bor(b, BTN_SELECT) end
+    if kb.enter then b = bor(b, BTN_START) end
+    if kb.up then b = bor(b, BTN_UP) end
+    if kb.down then b = bor(b, BTN_DOWN) end
+    if kb.left then b = bor(b, BTN_LEFT) end
+    if kb.right then b = bor(b, BTN_RIGHT) end
+    buttons = b
 end
 
 function input.strobe(value)
